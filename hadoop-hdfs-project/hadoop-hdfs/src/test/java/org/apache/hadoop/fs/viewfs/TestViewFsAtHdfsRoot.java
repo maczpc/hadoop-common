@@ -41,12 +41,12 @@ import org.junit.BeforeClass;
 public class TestViewFsAtHdfsRoot extends ViewFsBaseTest {
   
   private static MiniDFSCluster cluster;
-  private static HdfsConfiguration CONF = new HdfsConfiguration();
+  private static final HdfsConfiguration CONF = new HdfsConfiguration();
   private static FileContext fc;
   
   @Override
   protected FileContextTestHelper createFileContextHelper() {
-    return new FileContextTestHelper("/tmp/TestViewFsAtHdfsRoot");
+    return new FileContextTestHelper();
   }
 
   @BeforeClass

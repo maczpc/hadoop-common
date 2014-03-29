@@ -186,7 +186,7 @@ public class TestDelegationTokenRemoteFetcher {
       NumberFormatException, AuthenticationException {
     bootstrap = startHttpServer(httpPort, testToken, serviceUrl);
     assertTrue("testRenewTokenFromHttp error",
-        Long.valueOf(EXP_DATE) == DelegationTokenFetcher.renewDelegationToken(
+        Long.parseLong(EXP_DATE) == DelegationTokenFetcher.renewDelegationToken(
             connectionFactory, serviceUrl, testToken));
     if (assertionError != null)
       throw assertionError;
@@ -294,7 +294,7 @@ public class TestDelegationTokenRemoteFetcher {
 
     private final Token<DelegationTokenIdentifier> token;
     private final String serviceUrl;
-    private ImmutableMap<String, Handler> routes = ImmutableMap.of(
+    private final ImmutableMap<String, Handler> routes = ImmutableMap.of(
         "/exception", new ExceptionHandler(),
         "/cancelDelegationToken", new CancelHandler(),
         "/getDelegationToken", new FetchHandler() , 

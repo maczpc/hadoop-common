@@ -151,12 +151,7 @@ public class INodeFile extends INodeWithAdditionalFields
    * otherwise, return null.
    */
   public final FileUnderConstructionFeature getFileUnderConstructionFeature() {
-    for (Feature f : features) {
-      if (f instanceof FileUnderConstructionFeature) {
-        return (FileUnderConstructionFeature) f;
-      }
-    }
-    return null;
+    return getFeature(FileUnderConstructionFeature.class);
   }
 
   /** Is this file under construction? */
@@ -252,7 +247,7 @@ public class INodeFile extends INodeWithAdditionalFields
   
   /* Start of Snapshot Feature */
 
-  private FileWithSnapshotFeature addSnapshotFeature(FileDiffList diffs) {
+  public FileWithSnapshotFeature addSnapshotFeature(FileDiffList diffs) {
     Preconditions.checkState(!isWithSnapshot(), 
         "File is already with snapshot");
     FileWithSnapshotFeature sf = new FileWithSnapshotFeature(diffs);
@@ -265,12 +260,7 @@ public class INodeFile extends INodeWithAdditionalFields
    * otherwise, return null.
    */
   public final FileWithSnapshotFeature getFileWithSnapshotFeature() {
-    for (Feature f: features) {
-      if (f instanceof FileWithSnapshotFeature) {
-        return (FileWithSnapshotFeature) f;
-      }
-    }
-    return null;
+    return getFeature(FileWithSnapshotFeature.class);
   }
 
   /** Is this file has the snapshot feature? */

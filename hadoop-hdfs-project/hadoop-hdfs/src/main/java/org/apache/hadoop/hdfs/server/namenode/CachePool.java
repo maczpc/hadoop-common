@@ -47,8 +47,6 @@ import com.google.common.base.Preconditions;
  */
 @InterfaceAudience.Private
 public final class CachePool {
-  public static final Log LOG = LogFactory.getLog(CachePool.class);
-
   @Nonnull
   private final String poolName;
 
@@ -87,7 +85,7 @@ public final class CachePool {
 
   public final static class DirectiveList
       extends IntrusiveCollection<CacheDirective> {
-    private CachePool cachePool;
+    private final CachePool cachePool;
 
     private DirectiveList(CachePool cachePool) {
       this.cachePool = cachePool;

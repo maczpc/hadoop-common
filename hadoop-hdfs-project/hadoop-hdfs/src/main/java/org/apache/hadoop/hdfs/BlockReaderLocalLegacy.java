@@ -31,7 +31,6 @@ import java.util.Map;
 
 import org.apache.hadoop.fs.ReadOption;
 import org.apache.hadoop.hdfs.client.ClientMmap;
-import org.apache.hadoop.hdfs.client.ClientMmapManager;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.conf.Configuration;
@@ -138,7 +137,7 @@ class BlockReaderLocalLegacy implements BlockReader {
   
   // Multiple datanodes could be running on the local machine. Store proxies in
   // a map keyed by the ipc port of the datanode.
-  private static Map<Integer, LocalDatanodeInfo> localDatanodeInfoMap = new HashMap<Integer, LocalDatanodeInfo>();
+  private static final Map<Integer, LocalDatanodeInfo> localDatanodeInfoMap = new HashMap<Integer, LocalDatanodeInfo>();
 
   private final FileInputStream dataIn; // reader for the data file
   private final FileInputStream checksumIn;   // reader for the checksum file
@@ -163,7 +162,7 @@ class BlockReaderLocalLegacy implements BlockReader {
   private DataChecksum checksum;
   private final boolean verifyChecksum;
 
-  private static DirectBufferPool bufferPool = new DirectBufferPool();
+  private static final DirectBufferPool bufferPool = new DirectBufferPool();
 
   private final int bytesPerChecksum;
   private final int checksumSize;
@@ -175,19 +174,21 @@ class BlockReaderLocalLegacy implements BlockReader {
   /**
    * The only way this object can be instantiated.
    */
-  static BlockReaderLocalLegacy newBlockReader(DFSClient dfsClient,
-      String file, ExtendedBlock blk, Token<BlockTokenIdentifier> token,
-      DatanodeInfo node, long startOffset, long length)
-      throws IOException {
-    final DFSClient.Conf conf = dfsClient.getConf();
-
+  static BlockReaderLocalLegacy newBlockReader(DFSClient.Conf conf,
+      UserGroupInformation userGroupInformation,
+      Configuration configuration, String file, ExtendedBlock blk,
+      Token<BlockTokenIdentifier> token, DatanodeInfo node, 
+      long startOffset, long length) throws IOException {
     LocalDatanodeInfo localDatanodeInfo = getLocalDatanodeInfo(node
         .getIpcPort());
     // check the cache first
     BlockLocalPathInfo pathinfo = localDatanodeInfo.getBlockLocalPathInfo(blk);
     if (pathinfo == null) {
-      pathinfo = getBlockPathInfo(dfsClient.ugi, blk, node,
-          dfsClient.getConfiguration(), dfsClient.getHdfsTimeout(), token,
+      if (userGroupInformation == null) {
+        userGroupInformation = UserGroupInformation.getCurrentUser();
+      }
+      pathinfo = getBlockPathInfo(userGroupInformation, blk, node,
+          configuration, conf.hdfsTimeout, token,
           conf.connectToDnViaHostname);
     }
 
@@ -629,7 +630,7 @@ class BlockReaderLocalLegacy implements BlockReader {
         skipBuf = new byte[bytesPerChecksum];
       }
       int ret = read(skipBuf, 0, (int)(n - remaining));
-      return ret;
+      return (remaining + ret);
     }
   
     // optimize for big gap: discard the current buffer, skip to
@@ -660,9 +661,9 @@ class BlockReaderLocalLegacy implements BlockReader {
     int ret = read(skipBuf, 0, myOffsetFromChunkBoundary);
 
     if (ret == -1) {  // EOS
-      return toskip;
+      return (toskip + remaining);
     } else {
-      return (toskip + ret);
+      return (toskip + remaining + ret);
     }
   }
 
@@ -708,8 +709,7 @@ class BlockReaderLocalLegacy implements BlockReader {
   }
 
   @Override
-  public ClientMmap getClientMmap(EnumSet<ReadOption> opts,
-        ClientMmapManager mmapManager) {
+  public ClientMmap getClientMmap(EnumSet<ReadOption> opts) {
     return null;
   }
 }

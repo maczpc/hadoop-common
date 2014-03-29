@@ -79,7 +79,7 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
 
   /**
    * Create rolling logs.
-   * 
+   *
    * @param prefix the prefix of the log names.
    * @return rolling logs
    */
@@ -88,6 +88,9 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
 
   /** @return a list of volumes. */
   public List<V> getVolumes();
+
+  /** @return a storage with the given storage ID */
+  public DatanodeStorage getStorage(final String storageUuid);
 
   /** @return one or more storage reports for attached volumes. */
   public StorageReport[] getStorageReports(String bpid)
@@ -320,6 +323,14 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
    */
   public void uncache(String bpid, long[] blockIds);
 
+  /**
+   * Determine if the specified block is cached.
+   * @param bpid Block pool id
+   * @param blockIds - block id
+   * @returns true if the block is cached
+   */
+  public boolean isCached(String bpid, long blockId);
+
     /**
      * Check if all the data directories are healthy
      * @throws DiskErrorException
@@ -405,11 +416,29 @@ public interface FsDatasetSpi<V extends FsVolumeSpi> extends FSDatasetMBean {
    * Get a {@link HdfsBlocksMetadata} corresponding to the list of blocks in 
    * <code>blocks</code>.
    * 
-   * @param blocks List of blocks for which to return metadata
+   * @param bpid pool to query
+   * @param blockIds List of block ids for which to return metadata
    * @return metadata Metadata for the list of blocks
    * @throws IOException
    */
-  public HdfsBlocksMetadata getHdfsBlocksMetadata(List<ExtendedBlock> blocks)
-      throws IOException;
+  public HdfsBlocksMetadata getHdfsBlocksMetadata(String bpid,
+      long[] blockIds) throws IOException;
+
+  /**
+   * Enable 'trash' for the given dataset. When trash is enabled, files are
+   * moved to a separate trash directory instead of being deleted immediately.
+   * This can be useful for example during rolling upgrades.
+   */
+  public void enableTrash(String bpid);
+
+  /**
+   * Restore trash
+   */
+  public void restoreTrash(String bpid);
+
+  /**
+   * @return true when trash is enabled
+   */
+  public boolean trashEnabled(String bpid);
 }
 

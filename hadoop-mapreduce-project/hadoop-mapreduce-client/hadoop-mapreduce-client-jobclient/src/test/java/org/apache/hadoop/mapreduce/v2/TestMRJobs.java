@@ -23,11 +23,11 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
-import java.io.InputStreamReader;
 import java.io.IOException;
 import java.io.StringReader;
 import java.net.URI;
 import java.security.PrivilegedExceptionAction;
+import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.Map;
@@ -82,8 +82,10 @@ import org.apache.hadoop.security.token.TokenIdentifier;
 import org.apache.hadoop.util.JarFinder;
 import org.apache.hadoop.util.Shell;
 import org.apache.hadoop.yarn.api.records.ApplicationId;
+import org.apache.hadoop.yarn.api.records.ContainerId;
 import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.server.resourcemanager.rmapp.RMAppState;
+import org.apache.hadoop.yarn.util.ConverterUtils;
 import org.apache.log4j.Level;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -441,9 +443,12 @@ public class TestMRJobs {
     final SleepJob sleepJob = new SleepJob();
     final JobConf sleepConf = new JobConf(mrCluster.getConfig());
     sleepConf.set(MRJobConfig.MAP_LOG_LEVEL, Level.ALL.toString());
-    sleepConf.set(MRJobConfig.MR_AM_LOG_LEVEL, Level.ALL.toString());
-    sleepConf.setLong(MRJobConfig.TASK_USERLOG_LIMIT, 1);
+    final long userLogKb = 4;
+    sleepConf.setLong(MRJobConfig.TASK_USERLOG_LIMIT, userLogKb);
     sleepConf.setInt(MRJobConfig.TASK_LOG_BACKUPS, 3);
+    sleepConf.set(MRJobConfig.MR_AM_LOG_LEVEL, Level.ALL.toString());
+    final long amLogKb = 7;
+    sleepConf.setLong(MRJobConfig.MR_AM_LOG_KB, amLogKb);
     sleepConf.setInt(MRJobConfig.MR_AM_LOG_BACKUPS, 7);
     sleepJob.setConf(sleepConf);
 
@@ -492,27 +497,18 @@ public class TestMRJobs {
         LOG.info("Checking for glob: " + absSyslogGlob);
         final FileStatus[] syslogs = localFs.globStatus(absSyslogGlob);
         for (FileStatus slog : syslogs) {
-          // check all syslogs for the container
-          //
-          final FileStatus[] sysSiblings = localFs.globStatus(new Path(
-              slog.getPath().getParent(), TaskLog.LogName.SYSLOG + "*"));
-          boolean foundAppMaster = false;
-          floop:
-          for (FileStatus f : sysSiblings) {
-            final BufferedReader reader = new BufferedReader(
-                new InputStreamReader(localFs.open(f.getPath())));
-            String line;
-            try {
-              while ((line = reader.readLine()) != null) {
-                if (line.contains(MRJobConfig.APPLICATION_MASTER_CLASS)) {
-                  foundAppMaster = true;
-                  break floop;
-                }
-              }
-            } finally {
-              reader.close();
-            }
+          boolean foundAppMaster = job.isUber();
+          final Path containerPathComponent = slog.getPath().getParent();
+          if (!foundAppMaster) {
+            final ContainerId cid = ConverterUtils.toContainerId(
+                containerPathComponent.getName());
+            foundAppMaster = (cid.getId() == 1);
           }
+
+          final FileStatus[] sysSiblings = localFs.globStatus(new Path(
+              containerPathComponent, TaskLog.LogName.SYSLOG + "*"));
+          // sort to ensure for i > 0 sysSiblings[i] == "syslog.i"
+          Arrays.sort(sysSiblings);
 
           if (foundAppMaster) {
             numAppMasters++;
@@ -520,11 +516,19 @@ public class TestMRJobs {
             numMapTasks++;
           }
 
-          Assert.assertSame("Number of sylog* files",
-              foundAppMaster
-                ? sleepConf.getInt(MRJobConfig.MR_AM_LOG_BACKUPS, 0) + 1
-                : sleepConf.getInt(MRJobConfig.TASK_LOG_BACKUPS, 0) + 1,
-              sysSiblings.length);
+          if (foundAppMaster) {
+            Assert.assertSame("Unexpected number of AM sylog* files",
+                sleepConf.getInt(MRJobConfig.MR_AM_LOG_BACKUPS, 0) + 1,
+                sysSiblings.length);
+            Assert.assertTrue("AM syslog.1 length kb should be >= " + amLogKb,
+                sysSiblings[1].getLen() >= amLogKb * 1024);
+          } else {
+            Assert.assertSame("Unexpected number of MR task sylog* files",
+                sleepConf.getInt(MRJobConfig.TASK_LOG_BACKUPS, 0) + 1,
+                sysSiblings.length);
+            Assert.assertTrue("MR syslog.1 length kb should be >= " + userLogKb,
+                sysSiblings[1].getLen() >= userLogKb * 1024);
+          }
         }
       }
     }

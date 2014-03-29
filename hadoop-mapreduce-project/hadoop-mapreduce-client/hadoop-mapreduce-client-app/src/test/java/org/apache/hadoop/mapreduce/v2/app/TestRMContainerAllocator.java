@@ -1386,7 +1386,7 @@ public class TestRMContainerAllocator {
     static final List<JobUpdatedNodesEvent> jobUpdatedNodeEvents 
     = new ArrayList<JobUpdatedNodesEvent>();
     private MyResourceManager rm;
-
+    private boolean isUnregistered = false;
     private static AppContext createAppContext(
         ApplicationAttemptId appAttemptId, Job job) {
       AppContext context = mock(AppContext.class);
@@ -1478,6 +1478,7 @@ public class TestRMContainerAllocator {
 
     @Override
     protected void unregister() {
+      isUnregistered=true;
     }
 
     @Override
@@ -1526,6 +1527,15 @@ public class TestRMContainerAllocator {
     @Override
     protected void startAllocatorThread() {
       // override to NOT start thread
+    }
+    
+    @Override
+    protected boolean isApplicationMasterRegistered() {
+      return super.isApplicationMasterRegistered();
+    }
+    
+    public boolean isUnregistered() {
+      return isUnregistered;
     }
         
   }
@@ -1652,8 +1662,16 @@ public class TestRMContainerAllocator {
     RMApp app = rm.submitApp(1024);
     dispatcher.await();
 
+    // Make a node to register so as to launch the AM.
+    MockNM amNodeManager = rm.registerNode("amNM:1234", 2048);
+    amNodeManager.nodeHeartbeat(true);
+    dispatcher.await();
+
     ApplicationAttemptId appAttemptId = app.getCurrentAppAttempt()
         .getAppAttemptId();
+    rm.sendAMLaunched(appAttemptId);
+    dispatcher.await();
+
     JobId jobId = MRBuilderUtils.newJobId(appAttemptId.getApplicationId(), 0);
     Job job = mock(Job.class);
     when(job.getReport()).thenReturn(
@@ -1766,6 +1784,51 @@ public class TestRMContainerAllocator {
     TaskAttemptEvent abortedEvent = allocator.createContainerFinishedEvent(
         abortedStatus, attemptId);
     Assert.assertEquals(TaskAttemptEventType.TA_KILL, abortedEvent.getType());
+  }
+  
+  @Test
+  public void testUnregistrationOnlyIfRegistered() throws Exception {
+    Configuration conf = new Configuration();
+    final MyResourceManager rm = new MyResourceManager(conf);
+    rm.start();
+    DrainDispatcher rmDispatcher =
+        (DrainDispatcher) rm.getRMContext().getDispatcher();
+
+    // Submit the application
+    RMApp rmApp = rm.submitApp(1024);
+    rmDispatcher.await();
+
+    MockNM amNodeManager = rm.registerNode("127.0.0.1:1234", 11264);
+    amNodeManager.nodeHeartbeat(true);
+    rmDispatcher.await();
+
+    final ApplicationAttemptId appAttemptId =
+        rmApp.getCurrentAppAttempt().getAppAttemptId();
+    rm.sendAMLaunched(appAttemptId);
+    rmDispatcher.await();
+
+    MRApp mrApp =
+        new MRApp(appAttemptId, ContainerId.newInstance(appAttemptId, 0), 10,
+            0, false, this.getClass().getName(), true, 1) {
+          @Override
+          protected Dispatcher createDispatcher() {
+            return new DrainDispatcher();
+          }
+
+          protected ContainerAllocator createContainerAllocator(
+              ClientService clientService, AppContext context) {
+            return new MyContainerAllocator(rm, appAttemptId, context);
+          };
+        };
+
+    mrApp.submit(conf);
+    DrainDispatcher amDispatcher = (DrainDispatcher) mrApp.getDispatcher();
+    MyContainerAllocator allocator =
+        (MyContainerAllocator) mrApp.getContainerAllocator();
+    amDispatcher.await();
+    Assert.assertTrue(allocator.isApplicationMasterRegistered());
+    mrApp.stop();
+    Assert.assertTrue(allocator.isUnregistered());
   }
   
   public static void main(String[] args) throws Exception {

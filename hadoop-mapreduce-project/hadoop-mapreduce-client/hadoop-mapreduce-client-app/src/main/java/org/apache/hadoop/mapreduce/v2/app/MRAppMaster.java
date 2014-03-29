@@ -1026,14 +1026,13 @@ public class MRAppMaster extends CompositeService {
     AMInfo amInfo =
         MRBuilderUtils.newAMInfo(appAttemptID, startTime, containerID, nmHost,
             nmPort, nmHttpPort);
-    amInfos.add(amInfo);
 
     // /////////////////// Create the job itself.
     job = createJob(getConfig(), forcedState, shutDownMessage);
 
     // End of creating the job.
 
-    // Send out an MR AM inited event for this AM and all previous AMs.
+    // Send out an MR AM inited event for all previous AMs.
     for (AMInfo info : amInfos) {
       dispatcher.getEventHandler().handle(
           new JobHistoryEvent(job.getID(), new AMStartedEvent(info
@@ -1041,6 +1040,15 @@ public class MRAppMaster extends CompositeService {
               info.getNodeManagerHost(), info.getNodeManagerPort(), info
                   .getNodeManagerHttpPort())));
     }
+
+    // Send out an MR AM inited event for this AM.
+    dispatcher.getEventHandler().handle(
+        new JobHistoryEvent(job.getID(), new AMStartedEvent(amInfo
+            .getAppAttemptId(), amInfo.getStartTime(), amInfo.getContainerId(),
+            amInfo.getNodeManagerHost(), amInfo.getNodeManagerPort(), amInfo
+                .getNodeManagerHttpPort(), this.forcedState == null ? null
+                    : this.forcedState.toString())));
+    amInfos.add(amInfo);
 
     // metrics system init is really init & start.
     // It's more test friendly to put it here.
@@ -1080,6 +1088,8 @@ public class MRAppMaster extends CompositeService {
     //start all the components
     super.serviceStart();
 
+    // set job classloader if configured
+    MRApps.setJobClassLoader(getConfig());
     // All components have started, start the job.
     startJobs();
   }
@@ -1382,12 +1392,7 @@ public class MRAppMaster extends CompositeService {
       JobConf conf = new JobConf(new YarnConfiguration());
       conf.addResource(new Path(MRJobConfig.JOB_CONF_FILE));
       
-      // Explicitly disabling SSL for map reduce task as we can't allow MR users
-      // to gain access to keystore file for opening SSL listener. We can trust
-      // RM/NM to issue SSL certificates but definitely not MR-AM as it is
-      // running in user-land.
       MRWebAppUtil.initialize(conf);
-      HttpConfig.setPolicy(HttpConfig.Policy.HTTP_ONLY);
       // log the system properties
       String systemPropsToLog = MRApps.getSystemPropertiesToLog(conf);
       if (systemPropsToLog != null) {
@@ -1401,8 +1406,6 @@ public class MRAppMaster extends CompositeService {
       // SIGTERM I have a chance to write out the job history. I'll be closing
       // the objects myself.
       conf.setBoolean("fs.automatic.close", false);
-      // set job classloader if configured
-      MRApps.setJobClassLoader(conf);
       initAndStartAppMaster(appMaster, conf, jobUserName);
     } catch (Throwable t) {
       LOG.fatal("Error starting MRAppMaster", t);
@@ -1489,4 +1492,7 @@ public class MRAppMaster extends CompositeService {
     LogManager.shutdown();
   }
 
+  public ClientService getClientService() {
+    return clientService;
+  }
 }

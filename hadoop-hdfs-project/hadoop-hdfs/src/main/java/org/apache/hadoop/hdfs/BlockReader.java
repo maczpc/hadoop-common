@@ -23,8 +23,6 @@ import java.util.EnumSet;
 import org.apache.hadoop.fs.ByteBufferReadable;
 import org.apache.hadoop.fs.ReadOption;
 import org.apache.hadoop.hdfs.client.ClientMmap;
-import org.apache.hadoop.hdfs.client.ClientMmapManager;
-import org.apache.hadoop.hdfs.protocol.LocatedBlock;
 
 /**
  * A BlockReader is responsible for reading a single block
@@ -97,6 +95,5 @@ public interface BlockReader extends ByteBufferReadable {
    * @return              The ClientMmap object, or null if mmap is not
    *                      supported.
    */
-  ClientMmap getClientMmap(EnumSet<ReadOption> opts,
-        ClientMmapManager mmapManager);
+  ClientMmap getClientMmap(EnumSet<ReadOption> opts);
 }

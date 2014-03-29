@@ -78,6 +78,7 @@ import org.apache.hadoop.yarn.server.resourcemanager.scheduler.Allocation;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.QueueMetrics;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerAppReport;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplication;
+import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerApplicationAttempt.ContainersAndNMTokensAllocation;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerNodeReport;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.SchedulerUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.scheduler.event.AppAddedSchedulerEvent;
@@ -143,12 +144,6 @@ public class FairScheduler extends AbstractYarnScheduler {
   // How often fair shares are re-calculated (ms)
   protected long UPDATE_INTERVAL = 500;
 
-  private final static List<Container> EMPTY_CONTAINER_LIST =
-      new ArrayList<Container>();
-
-  private static final Allocation EMPTY_ALLOCATION =
-      new Allocation(EMPTY_CONTAINER_LIST, Resources.createResource(0));
-
   // Aggregate metrics
   FSQueueMetrics rootMetrics;
 
@@ -180,7 +175,7 @@ public class FairScheduler extends AbstractYarnScheduler {
   protected WeightAdjuster weightAdjuster; // Can be null for no weight adjuster
   protected boolean continuousSchedulingEnabled; // Continuous Scheduling enabled or not
   protected int continuousSchedulingSleepMs; // Sleep time for each pass in continuous scheduling
-  private Comparator nodeAvailableResourceComparator =
+  private Comparator<NodeId> nodeAvailableResourceComparator =
           new NodeAvailableResourceComparator(); // Node available resource comparator
   protected double nodeLocalityThreshold; // Cluster threshold for node locality
   protected double rackLocalityThreshold; // Cluster threshold for rack locality
@@ -616,9 +611,6 @@ public class FairScheduler extends AbstractYarnScheduler {
     RMApp rmApp = rmContext.getRMApps().get(applicationId);
     FSLeafQueue queue = assignToQueue(rmApp, queueName, user);
     if (queue == null) {
-      rmContext.getDispatcher().getEventHandler().handle(
-          new RMAppRejectedEvent(applicationId,
-              "Application rejected by queue placement policy"));
       return;
     }
 
@@ -684,27 +676,43 @@ public class FairScheduler extends AbstractYarnScheduler {
         new RMAppAttemptEvent(applicationAttemptId,
             RMAppAttemptEventType.ATTEMPT_ADDED));
   }
-  
+
+  /**
+   * Helper method that attempts to assign the app to a queue. The method is
+   * responsible to call the appropriate event-handler if the app is rejected.
+   */
   @VisibleForTesting
   FSLeafQueue assignToQueue(RMApp rmApp, String queueName, String user) {
     FSLeafQueue queue = null;
+    String appRejectMsg = null;
+
     try {
       QueuePlacementPolicy placementPolicy = allocConf.getPlacementPolicy();
       queueName = placementPolicy.assignAppToQueue(queueName, user);
       if (queueName == null) {
-        return null;
+        appRejectMsg = "Application rejected by queue placement policy";
+      } else {
+        queue = queueMgr.getLeafQueue(queueName, true);
+        if (queue == null) {
+          appRejectMsg = queueName + " is not a leaf queue";
+        }
       }
-      queue = queueMgr.getLeafQueue(queueName, true);
-    } catch (IOException ex) {
-      LOG.error("Error assigning app to queue, rejecting", ex);
+    } catch (IOException ioe) {
+      appRejectMsg = "Error assigning app to queue " + queueName;
     }
-    
+
+    if (appRejectMsg != null && rmApp != null) {
+      LOG.error(appRejectMsg);
+      rmContext.getDispatcher().getEventHandler().handle(
+          new RMAppRejectedEvent(rmApp.getApplicationId(), appRejectMsg));
+      return null;
+    }
+
     if (rmApp != null) {
       rmApp.setQueue(queue.getName());
     } else {
-      LOG.warn("Couldn't find RM app to set queue name on");
+      LOG.error("Couldn't find RM app to set queue name on");
     }
-    
     return queue;
   }
 
@@ -766,7 +774,9 @@ public class FairScheduler extends AbstractYarnScheduler {
     boolean wasRunnable = queue.removeApp(attempt);
 
     if (wasRunnable) {
-      maxRunningEnforcer.updateRunnabilityOnAppRemoval(attempt);
+      maxRunningEnforcer.untrackRunnableApp(attempt);
+      maxRunningEnforcer.updateRunnabilityOnAppRemoval(attempt,
+          attempt.getQueue());
     } else {
       maxRunningEnforcer.untrackNonRunnableApp(attempt);
     }
@@ -920,9 +930,11 @@ public class FairScheduler extends AbstractYarnScheduler {
       }
 
       application.updateBlacklist(blacklistAdditions, blacklistRemovals);
-      
-      return new Allocation(application.pullNewlyAllocatedContainers(),
-          application.getHeadroom(), preemptionContainerIds);
+      ContainersAndNMTokensAllocation allocation =
+          application.pullNewlyAllocatedContainersAndNMTokens();
+      return new Allocation(allocation.getContainerList(),
+        application.getHeadroom(), preemptionContainerIds, null, null,
+        allocation.getNMTokenList());
     }
   }
 
@@ -987,7 +999,13 @@ public class FairScheduler extends AbstractYarnScheduler {
   private void continuousScheduling() {
     while (true) {
       List<NodeId> nodeIdList = new ArrayList<NodeId>(nodes.keySet());
-      Collections.sort(nodeIdList, nodeAvailableResourceComparator);
+      // Sort the nodes by space available on them, so that we offer
+      // containers on emptier nodes first, facilitating an even spread. This
+      // requires holding the scheduler lock, so that the space available on a
+      // node doesn't change during the sort.
+      synchronized (this) {
+        Collections.sort(nodeIdList, nodeAvailableResourceComparator);
+      }
 
       // iterate all nodes
       for (NodeId nodeId : nodeIdList) {
@@ -1041,10 +1059,12 @@ public class FairScheduler extends AbstractYarnScheduler {
         reservedAppSchedulable = null;
       } else {
         // Reservation exists; try to fulfill the reservation
-        LOG.info("Trying to fulfill reservation for application "
-            + reservedAppSchedulable.getApp().getApplicationAttemptId()
-            + " on node: " + node);
-
+        if (LOG.isDebugEnabled()) {
+          LOG.debug("Trying to fulfill reservation for application "
+              + reservedAppSchedulable.getApp().getApplicationAttemptId()
+              + " on node: " + node);
+        }
+        
         node.getReservedAppSchedulable().assignReservedContainer(node);
       }
     }
@@ -1087,7 +1107,9 @@ public class FairScheduler extends AbstractYarnScheduler {
       ApplicationAttemptId appAttemptId) {
     FSSchedulerApp attempt = getSchedulerApp(appAttemptId);
     if (attempt == null) {
-      LOG.error("Request for appInfo of unknown attempt" + appAttemptId);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Request for appInfo of unknown attempt " + appAttemptId);
+      }
       return null;
     }
     return new SchedulerAppReport(attempt);
@@ -1098,7 +1120,9 @@ public class FairScheduler extends AbstractYarnScheduler {
       ApplicationAttemptId appAttemptId) {
     FSSchedulerApp attempt = getSchedulerApp(appAttemptId);
     if (attempt == null) {
-      LOG.error("Request for appInfo of unknown attempt" + appAttemptId);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("Request for appInfo of unknown attempt " + appAttemptId);
+      }
       return null;
     }
     return attempt.getResourceUsageReport();
@@ -1354,5 +1378,122 @@ public class FairScheduler extends AbstractYarnScheduler {
     List<ApplicationAttemptId> apps = new ArrayList<ApplicationAttemptId>();
     queue.collectSchedulerApplications(apps);
     return apps;
+  }
+
+  @Override
+  public synchronized String moveApplication(ApplicationId appId,
+      String queueName) throws YarnException {
+    SchedulerApplication app = applications.get(appId);
+    if (app == null) {
+      throw new YarnException("App to be moved " + appId + " not found.");
+    }
+    FSSchedulerApp attempt = (FSSchedulerApp) app.getCurrentAppAttempt();
+    // To serialize with FairScheduler#allocate, synchronize on app attempt
+    synchronized (attempt) {
+      FSLeafQueue oldQueue = (FSLeafQueue) app.getQueue();
+      FSLeafQueue targetQueue = queueMgr.getLeafQueue(queueName, false);
+      if (targetQueue == null) {
+        throw new YarnException("Target queue " + queueName
+            + " not found or is not a leaf queue.");
+      }
+      if (targetQueue == oldQueue) {
+        return oldQueue.getQueueName();
+      }
+      
+      if (oldQueue.getRunnableAppSchedulables().contains(
+          attempt.getAppSchedulable())) {
+        verifyMoveDoesNotViolateConstraints(attempt, oldQueue, targetQueue);
+      }
+      
+      executeMove(app, attempt, oldQueue, targetQueue);
+      return targetQueue.getQueueName();
+    }
+  }
+  
+  private void verifyMoveDoesNotViolateConstraints(FSSchedulerApp app,
+      FSLeafQueue oldQueue, FSLeafQueue targetQueue) throws YarnException {
+    String queueName = targetQueue.getQueueName();
+    ApplicationAttemptId appAttId = app.getApplicationAttemptId();
+    // When checking maxResources and maxRunningApps, only need to consider
+    // queues before the lowest common ancestor of the two queues because the
+    // total running apps in queues above will not be changed.
+    FSQueue lowestCommonAncestor = findLowestCommonAncestorQueue(oldQueue,
+        targetQueue);
+    Resource consumption = app.getCurrentConsumption();
+    
+    // Check whether the move would go over maxRunningApps or maxShare
+    FSQueue cur = targetQueue;
+    while (cur != lowestCommonAncestor) {
+      // maxRunningApps
+      if (cur.getNumRunnableApps() == allocConf.getQueueMaxApps(cur.getQueueName())) {
+        throw new YarnException("Moving app attempt " + appAttId + " to queue "
+            + queueName + " would violate queue maxRunningApps constraints on"
+            + " queue " + cur.getQueueName());
+      }
+      
+      // maxShare
+      if (!Resources.fitsIn(Resources.add(cur.getResourceUsage(), consumption),
+          cur.getMaxShare())) {
+        throw new YarnException("Moving app attempt " + appAttId + " to queue "
+            + queueName + " would violate queue maxShare constraints on"
+            + " queue " + cur.getQueueName());
+      }
+      
+      cur = cur.getParent();
+    }
+  }
+  
+  /**
+   * Helper for moveApplication, which has appropriate synchronization, so all
+   * operations will be atomic.
+   */
+  private void executeMove(SchedulerApplication app, FSSchedulerApp attempt,
+      FSLeafQueue oldQueue, FSLeafQueue newQueue) {
+    boolean wasRunnable = oldQueue.removeApp(attempt);
+    // if app was not runnable before, it may be runnable now
+    boolean nowRunnable = maxRunningEnforcer.canAppBeRunnable(newQueue,
+        attempt.getUser());
+    if (wasRunnable && !nowRunnable) {
+      throw new IllegalStateException("Should have already verified that app "
+          + attempt.getApplicationId() + " would be runnable in new queue");
+    }
+    
+    if (wasRunnable) {
+      maxRunningEnforcer.untrackRunnableApp(attempt);
+    } else if (nowRunnable) {
+      // App has changed from non-runnable to runnable
+      maxRunningEnforcer.untrackNonRunnableApp(attempt);
+    }
+    
+    attempt.move(newQueue); // This updates all the metrics
+    app.setQueue(newQueue);
+    newQueue.addApp(attempt, nowRunnable);
+    
+    if (nowRunnable) {
+      maxRunningEnforcer.trackRunnableApp(attempt);
+    }
+    if (wasRunnable) {
+      maxRunningEnforcer.updateRunnabilityOnAppRemoval(attempt, oldQueue);
+    }
+  }
+  
+  private FSQueue findLowestCommonAncestorQueue(FSQueue queue1, FSQueue queue2) {
+    // Because queue names include ancestors, separated by periods, we can find
+    // the lowest common ancestors by going from the start of the names until
+    // there's a character that doesn't match.
+    String name1 = queue1.getName();
+    String name2 = queue2.getName();
+    // We keep track of the last period we encounter to avoid returning root.apple
+    // when the queues are root.applepie and root.appletart
+    int lastPeriodIndex = -1;
+    for (int i = 0; i < Math.max(name1.length(), name2.length()); i++) {
+      if (name1.length() <= i || name2.length() <= i ||
+          name1.charAt(i) != name2.charAt(i)) {
+        return queueMgr.getQueue(name1.substring(lastPeriodIndex));
+      } else if (name1.charAt(i) == '.') {
+        lastPeriodIndex = i;
+      }
+    }
+    return queue1; // names are identical
   }
 }

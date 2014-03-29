@@ -105,7 +105,7 @@ public class HostFileManager {
         prefix = entry.substring(0, idx);
         String portStr = entry.substring(idx + 1);
         try {
-          port = Integer.valueOf(portStr);
+          port = Integer.parseInt(portStr);
         } catch (NumberFormatException e) {
           throw new IOException("unable to parse port number for " +
               "'" + entry + "'", e);
@@ -168,7 +168,7 @@ public class HostFileManager {
      * The different indexing strategies reflect the fact that we may or may
      * not have a port or IP address for each entry.
      */
-    TreeMap<String, Entry> index = new TreeMap<String, Entry>();
+    final TreeMap<String, Entry> index = new TreeMap<String, Entry>();
 
     public boolean isEmpty() {
       return index.isEmpty();

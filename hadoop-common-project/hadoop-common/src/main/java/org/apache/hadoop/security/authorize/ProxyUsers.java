@@ -20,6 +20,7 @@ package org.apache.hadoop.security.authorize;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
@@ -27,8 +28,11 @@ import java.util.Map.Entry;
 
 import org.apache.hadoop.classification.InterfaceAudience;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.security.Groups;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.util.StringUtils;
+
+import com.google.common.annotations.VisibleForTesting;
 
 @InterfaceAudience.Private
 public class ProxyUsers {
@@ -66,8 +70,11 @@ public class ProxyUsers {
     String regex = CONF_HADOOP_PROXYUSER_RE+"[^.]*\\"+CONF_GROUPS;
     Map<String,String> allMatchKeys = conf.getValByRegex(regex);
     for(Entry<String, String> entry : allMatchKeys.entrySet()) {
-      proxyGroups.put(entry.getKey(), 
-          StringUtils.getStringCollection(entry.getValue()));
+      Collection<String> groups = StringUtils.getStringCollection(entry.getValue());
+      proxyGroups.put(entry.getKey(), groups );
+      //cache the groups. This is needed for NetGroups
+      Groups.getUserToGroupsMappingService(conf).cacheGroupsAdd(
+          new ArrayList<String>(groups));
     }
 
     // now hosts
@@ -177,4 +184,13 @@ public class ProxyUsers {
       (list.contains("*"));
   }
 
+  @VisibleForTesting
+  public static Map<String, Collection<String>> getProxyGroups() {
+    return proxyGroups;
+  }
+
+  @VisibleForTesting
+  public static Map<String, Collection<String>> getProxyHosts() {
+    return proxyHosts;
+  }
 }

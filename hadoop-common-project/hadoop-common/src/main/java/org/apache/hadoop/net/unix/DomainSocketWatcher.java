@@ -37,6 +37,7 @@ import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.apache.hadoop.util.NativeCodeLoader;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.util.concurrent.Uninterruptibles;
 
@@ -48,7 +49,7 @@ import com.google.common.util.concurrent.Uninterruptibles;
  * See {@link DomainSocket} for more information about UNIX domain sockets.
  */
 @InterfaceAudience.LimitedPrivate("HDFS")
-public final class DomainSocketWatcher extends Thread implements Closeable {
+public final class DomainSocketWatcher implements Closeable {
   static {
     if (SystemUtils.IS_OS_WINDOWS) {
       loadingFailureReason = "UNIX Domain sockets are not available on Windows.";
@@ -80,7 +81,11 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
    */
   private static native void anchorNative();
 
-  interface Handler {
+  public static String getLoadingFailureReason() {
+    return loadingFailureReason;
+  }
+
+  public interface Handler {
     /**
      * Handles an event on a socket.  An event may be the socket becoming
      * readable, or the remote end being closed.
@@ -227,9 +232,10 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
     if (loadingFailureReason != null) {
       throw new UnsupportedOperationException(loadingFailureReason);
     }
-    notificationSockets = DomainSocket.socketpair();
-    this.interruptCheckPeriodMs = interruptCheckPeriodMs;
     Preconditions.checkArgument(interruptCheckPeriodMs > 0);
+    this.interruptCheckPeriodMs = interruptCheckPeriodMs;
+    notificationSockets = DomainSocket.socketpair();
+    watcherThread.setDaemon(true);
     watcherThread.start();
   }
 
@@ -240,10 +246,12 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
    */
   @Override
   public void close() throws IOException {
+    lock.lock();
     try {
-      lock.lock();
       if (closed) return;
-      LOG.info(this + ": closing");
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(this + ": closing");
+      }
       closed = true;
     } finally {
       lock.unlock();
@@ -256,6 +264,16 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
     Uninterruptibles.joinUninterruptibly(watcherThread);
   }
 
+  @VisibleForTesting
+  public boolean isClosed() {
+    lock.lock();
+    try {
+      return closed;
+    } finally {
+      lock.unlock();
+    }
+  }
+
   /**
    * Add a socket.
    *
@@ -265,15 +283,21 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
    *                   called any time after this function is called.
    */
   public void add(DomainSocket sock, Handler handler) {
+    lock.lock();
     try {
-      lock.lock();
-      checkNotClosed();
+      if (closed) {
+        handler.handle(sock);
+        IOUtils.cleanup(LOG, sock);
+        return;
+      }
       Entry entry = new Entry(sock, handler);
       try {
         sock.refCount.reference();
-      } catch (ClosedChannelException e) {
-        Preconditions.checkArgument(false,
-            "tried to add a closed DomainSocket to " + this);
+      } catch (ClosedChannelException e1) {
+        // If the socket is already closed before we add it, invoke the
+        // handler immediately.  Then we're done.
+        handler.handle(sock);
+        return;
       }
       toAdd.add(entry);
       kick();
@@ -281,12 +305,11 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
         try {
           processedCond.await();
         } catch (InterruptedException e) {
-          this.interrupt();
+          Thread.currentThread().interrupt();
         }
         if (!toAdd.contains(entry)) {
           break;
         }
-        checkNotClosed();
       }
     } finally {
       lock.unlock();
@@ -299,21 +322,20 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
    * @param sock     The socket to remove.
    */
   public void remove(DomainSocket sock) {
+    lock.lock();
     try {
-      lock.lock();
-      checkNotClosed();
+      if (closed) return;
       toRemove.put(sock.fd, sock);
       kick();
       while (true) {
         try {
           processedCond.await();
         } catch (InterruptedException e) {
-          this.interrupt();
+          Thread.currentThread().interrupt();
         }
         if (!toRemove.containsKey(sock.fd)) {
           break;
         }
-        checkNotClosed();
       }
     } finally {
       lock.unlock();
@@ -327,18 +349,9 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
     try {
       notificationSockets[0].getOutputStream().write(0);
     } catch (IOException e) {
-      LOG.error(this + ": error writing to notificationSockets[0]", e);
-    }
-  }
-
-  /**
-   * Check that the DomainSocketWatcher is not closed.
-   * Must be called while holding the lock.
-   */
-  private void checkNotClosed() {
-    Preconditions.checkState(lock.isHeldByCurrentThread());
-    if (closed) {
-      throw new RuntimeException("DomainSocketWatcher is closed.");
+      if (!closed) {
+        LOG.error(this + ": error writing to notificationSockets[0]", e);
+      }
     }
   }
 
@@ -381,11 +394,14 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
     }
   }
 
-  private final Thread watcherThread = new Thread(new Runnable() {
+  @VisibleForTesting
+  final Thread watcherThread = new Thread(new Runnable() {
     @Override
     public void run() {
-      LOG.info(this + ": starting with interruptCheckPeriodMs = " +
-          interruptCheckPeriodMs);
+      if (LOG.isDebugEnabled()) {
+        LOG.debug(this + ": starting with interruptCheckPeriodMs = " +
+            interruptCheckPeriodMs);
+      }
       final TreeMap<Integer, Entry> entries = new TreeMap<Integer, Entry>();
       FdSet fdSet = new FdSet();
       addNotificationSocket(entries, fdSet);
@@ -425,7 +441,9 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
             // toRemove are now empty and processedCond has been notified if it
             // needed to be.
             if (closed) {
-              LOG.info(toString() + " thread terminating.");
+              if (LOG.isDebugEnabled()) {
+                LOG.debug(toString() + " thread terminating.");
+              }
               return;
             }
             // Check if someone sent our thread an InterruptedException while we
@@ -443,6 +461,7 @@ public final class DomainSocketWatcher extends Thread implements Closeable {
       } catch (IOException e) {
         LOG.error(toString() + " terminating on IOException", e);
       } finally {
+        kick(); // allow the handler for notificationSockets[0] to read a byte
         for (Entry entry : entries.values()) {
           sendCallback("close", entries, fdSet, entry.getDomainSocket().fd);
         }

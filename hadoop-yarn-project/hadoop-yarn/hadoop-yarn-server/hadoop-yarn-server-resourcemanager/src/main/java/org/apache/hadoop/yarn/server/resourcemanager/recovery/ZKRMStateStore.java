@@ -48,6 +48,7 @@ import org.apache.hadoop.yarn.proto.YarnServerResourceManagerServiceProtos.Appli
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerServiceProtos.ApplicationStateDataProto;
 import org.apache.hadoop.yarn.proto.YarnServerResourceManagerServiceProtos.RMStateVersionProto;
 import org.apache.hadoop.yarn.security.client.RMDelegationTokenIdentifier;
+import org.apache.hadoop.yarn.server.resourcemanager.RMZKUtils;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.RMStateVersion;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.ApplicationAttemptStateDataPBImpl;
 import org.apache.hadoop.yarn.server.resourcemanager.recovery.records.impl.pb.ApplicationStateDataPBImpl;
@@ -91,6 +92,7 @@ public class ZKRMStateStore extends RMStateStore {
   private int zkSessionTimeout;
   private long zkRetryInterval;
   private List<ACL> zkAcl;
+  private List<ZKUtil.ZKAuthInfo> zkAuths;
 
   /**
    *
@@ -137,6 +139,7 @@ public class ZKRMStateStore extends RMStateStore {
   private String fencingNodePath;
   private Op createFencingNodePathOp;
   private Op deleteFencingNodePathOp;
+  private Thread verifyActiveStatusThread;
   private String zkRootNodeUsername;
   private final String zkRootNodePassword = Long.toString(random.nextLong());
 
@@ -199,18 +202,9 @@ public class ZKRMStateStore extends RMStateStore {
     zkRetryInterval =
         conf.getLong(YarnConfiguration.RM_ZK_RETRY_INTERVAL_MS,
           YarnConfiguration.DEFAULT_RM_ZK_RETRY_INTERVAL_MS);
-    // Parse authentication from configuration.
-    String zkAclConf =
-        conf.get(YarnConfiguration.RM_ZK_ACL,
-            YarnConfiguration.DEFAULT_RM_ZK_ACL);
-    zkAclConf = ZKUtil.resolveConfIndirection(zkAclConf);
 
-    try {
-      zkAcl = ZKUtil.parseACLs(zkAclConf);
-    } catch (ZKUtil.BadAclFormatException bafe) {
-      LOG.error("Invalid format for " + YarnConfiguration.RM_ZK_ACL);
-      throw bafe;
-    }
+    zkAcl = RMZKUtils.getZKAcls(conf);
+    zkAuths = RMZKUtils.getZKAuths(conf);
 
     zkRootNodePath = getNodePath(znodeWorkingPath, ROOT_ZNODE_NAME);
     rmAppRoot = getNodePath(zkRootNodePath, RM_APP_ROOT);
@@ -258,6 +252,8 @@ public class ZKRMStateStore extends RMStateStore {
     createRootDir(zkRootNodePath);
     if (HAUtil.isHAEnabled(getConfig())){
       fence();
+      verifyActiveStatusThread = new VerifyActiveStatusThread();
+      verifyActiveStatusThread.start();
     }
     createRootDir(rmAppRoot);
     createRootDir(rmDTSecretManagerRoot);
@@ -350,6 +346,10 @@ public class ZKRMStateStore extends RMStateStore {
 
   @Override
   protected synchronized void closeInternal() throws Exception {
+    if (verifyActiveStatusThread != null) {
+      verifyActiveStatusThread.interrupt();
+      verifyActiveStatusThread.join(1000);
+    }
     closeZkClients();
   }
 
@@ -629,6 +629,54 @@ public class ZKRMStateStore extends RMStateStore {
       RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
       int latestSequenceNumber) throws Exception {
     ArrayList<Op> opList = new ArrayList<Op>();
+    addStoreOrUpdateOps(
+        opList, rmDTIdentifier, renewDate, latestSequenceNumber, false);
+    doMultiWithRetries(opList);
+  }
+
+  @Override
+  protected synchronized void removeRMDelegationTokenState(
+      RMDelegationTokenIdentifier rmDTIdentifier) throws Exception {
+    ArrayList<Op> opList = new ArrayList<Op>();
+    String nodeRemovePath =
+        getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
+            + rmDTIdentifier.getSequenceNumber());
+    if (LOG.isDebugEnabled()) {
+      LOG.debug("Removing RMDelegationToken_"
+          + rmDTIdentifier.getSequenceNumber());
+    }
+    if (zkClient.exists(nodeRemovePath, true) != null) {
+      opList.add(Op.delete(nodeRemovePath, -1));
+    } else {
+      LOG.info("Attempted to delete a non-existing znode " + nodeRemovePath);
+    }
+    doMultiWithRetries(opList);
+  }
+
+  @Override
+  protected void updateRMDelegationTokenAndSequenceNumberInternal(
+      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
+      int latestSequenceNumber) throws Exception {
+    ArrayList<Op> opList = new ArrayList<Op>();
+    String nodeRemovePath =
+        getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
+            + rmDTIdentifier.getSequenceNumber());
+    if (zkClient.exists(nodeRemovePath, true) == null) {
+      // in case znode doesn't exist
+      addStoreOrUpdateOps(
+          opList, rmDTIdentifier, renewDate, latestSequenceNumber, false);
+      LOG.info("Attempted to update a non-existing znode " + nodeRemovePath);
+    } else {
+      // in case znode exists
+      addStoreOrUpdateOps(
+          opList, rmDTIdentifier, renewDate, latestSequenceNumber, true);
+    }
+    doMultiWithRetries(opList);
+  }
+
+  private void addStoreOrUpdateOps(ArrayList<Op> opList,
+      RMDelegationTokenIdentifier rmDTIdentifier, Long renewDate,
+      int latestSequenceNumber, boolean isUpdate) throws Exception {
     // store RM delegation token
     String nodeCreatePath =
         getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
@@ -642,17 +690,21 @@ public class ZKRMStateStore extends RMStateStore {
       rmDTIdentifier.write(tokenOut);
       tokenOut.writeLong(renewDate);
       if (LOG.isDebugEnabled()) {
-        LOG.debug("Storing RMDelegationToken_" +
+        LOG.debug((isUpdate ? "Storing " : "Updating ") + "RMDelegationToken_" +
             rmDTIdentifier.getSequenceNumber());
       }
 
-      opList.add(Op.create(nodeCreatePath, tokenOs.toByteArray(), zkAcl,
-          CreateMode.PERSISTENT));
+      if (isUpdate) {
+        opList.add(Op.setData(nodeCreatePath, tokenOs.toByteArray(), -1));
+      } else {
+        opList.add(Op.create(nodeCreatePath, tokenOs.toByteArray(), zkAcl,
+            CreateMode.PERSISTENT));
+      }
 
 
      seqOut.writeInt(latestSequenceNumber);
      if (LOG.isDebugEnabled()) {
-        LOG.debug("Storing " + dtSequenceNumberPath +
+        LOG.debug((isUpdate ? "Storing " : "Updating ") + dtSequenceNumberPath +
             ". SequenceNumber: " + latestSequenceNumber);
       }
 
@@ -661,21 +713,6 @@ public class ZKRMStateStore extends RMStateStore {
       tokenOs.close();
       seqOs.close();
     }
-
-    doMultiWithRetries(opList);
-  }
-
-  @Override
-  protected synchronized void removeRMDelegationTokenState(
-      RMDelegationTokenIdentifier rmDTIdentifier) throws Exception {
-    String nodeRemovePath =
-        getNodePath(delegationTokensRootPath, DELEGATION_TOKEN_PREFIX
-            + rmDTIdentifier.getSequenceNumber());
-    if (LOG.isDebugEnabled()) {
-      LOG.debug("Removing RMDelegationToken_"
-          + rmDTIdentifier.getSequenceNumber());
-    }
-    deleteWithRetries(nodeRemovePath, -1);
   }
 
   @Override
@@ -707,7 +744,11 @@ public class ZKRMStateStore extends RMStateStore {
     if (LOG.isDebugEnabled()) {
       LOG.debug("Removing RMDelegationKey_" + delegationKey.getKeyId());
     }
-    deleteWithRetries(nodeRemovePath, -1);
+    if (zkClient.exists(nodeRemovePath, true) != null) {
+      doMultiWithRetries(Op.delete(nodeRemovePath, -1));
+    } else {
+      LOG.info("Attempted to delete a non-existing znode " + nodeRemovePath);
+    }
   }
 
   // ZK related code
@@ -813,18 +854,6 @@ public class ZKRMStateStore extends RMStateStore {
     doMultiWithRetries(Op.create(path, data, acl, mode));
   }
 
-  private void deleteWithRetries(final String path, final int version)
-      throws Exception {
-    try {
-      doMultiWithRetries(Op.delete(path, version));
-    } catch (KeeperException.NoNodeException nne) {
-      // We tried to delete a node that doesn't exist
-      if (LOG.isDebugEnabled()) {
-        LOG.debug("Attempted to delete a non-existing znode " + path);
-      }
-    }
-  }
-
   @VisibleForTesting
   @Private
   @Unstable
@@ -854,6 +883,32 @@ public class ZKRMStateStore extends RMStateStore {
         return zkClient.getChildren(path, watch);
       }
     }.runWithRetries();
+  }
+
+  /**
+   * Helper class that periodically attempts creating a znode to ensure that
+   * this RM continues to be the Active.
+   */
+  private class VerifyActiveStatusThread extends Thread {
+    private List<Op> emptyOpList = new ArrayList<Op>();
+
+    VerifyActiveStatusThread() {
+      super(VerifyActiveStatusThread.class.getName());
+    }
+
+    public void run() {
+      try {
+        while (true) {
+          doMultiWithRetries(emptyOpList);
+          Thread.sleep(zkSessionTimeout);
+        }
+      } catch (InterruptedException ie) {
+        LOG.info(VerifyActiveStatusThread.class.getName() + " thread " +
+            "interrupted! Exiting!");
+      } catch (Exception e) {
+        notifyStoreOperationFailed(new StoreFencedException());
+      }
+    }
   }
 
   private abstract class ZKAction<T> {
@@ -919,6 +974,9 @@ public class ZKRMStateStore extends RMStateStore {
         retries++) {
       try {
         zkClient = getNewZooKeeper();
+        for (ZKUtil.ZKAuthInfo zkAuth : zkAuths) {
+          zkClient.addAuthInfo(zkAuth.getScheme(), zkAuth.getAuth());
+        }
         if (useDefaultFencingScheme) {
           zkClient.addAuthInfo(zkRootNodeAuthScheme,
               (zkRootNodeUsername + ":" + zkRootNodePassword).getBytes());

@@ -97,9 +97,10 @@ public class HftpFileSystem extends FileSystem
   public static final String HFTP_TIMEZONE = "UTC";
   public static final String HFTP_DATE_FORMAT = "yyyy-MM-dd'T'HH:mm:ssZ";
 
-  protected TokenAspect<HftpFileSystem> tokenAspect;
+  protected TokenAspect<? extends HftpFileSystem> tokenAspect;
   private Token<?> delegationToken;
   private Token<?> renewToken;
+  protected Text tokenServiceName;
 
   @Override
   public URI getCanonicalUri() {
@@ -122,8 +123,7 @@ public class HftpFileSystem extends FileSystem
 
   @Override
   protected int getDefaultPort() {
-    return getConf().getInt(DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_KEY,
-        DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_DEFAULT);
+    return DFSConfigKeys.DFS_NAMENODE_HTTP_PORT_DEFAULT;
   }
 
   /**
@@ -134,7 +134,6 @@ public class HftpFileSystem extends FileSystem
    *  3. DFS_NAMENODE_HTTP_PORT_DEFAULT i.e. 50070.
    *
    * @param uri
-   * @return
    */
   protected InetSocketAddress getNamenodeAddr(URI uri) {
     // use authority so user supplied uri can override port
@@ -175,9 +174,8 @@ public class HftpFileSystem extends FileSystem
    * Initialize connectionFactory and tokenAspect. This function is intended to
    * be overridden by HsFtpFileSystem.
    */
-  protected void initTokenAspect(Configuration conf)
-      throws IOException {
-    tokenAspect = new TokenAspect<HftpFileSystem>(this, TOKEN_KIND);
+  protected void initTokenAspect() {
+    tokenAspect = new TokenAspect<HftpFileSystem>(this, tokenServiceName, TOKEN_KIND);
   }
 
   @Override
@@ -189,6 +187,7 @@ public class HftpFileSystem extends FileSystem
         .newDefaultURLConnectionFactory(conf);
     this.ugi = UserGroupInformation.getCurrentUser();
     this.nnUri = getNamenodeUri(name);
+    this.tokenServiceName = SecurityUtil.buildTokenService(nnUri);
 
     try {
       this.hftpURI = new URI(name.getScheme(), name.getAuthority(),
@@ -197,7 +196,7 @@ public class HftpFileSystem extends FileSystem
       throw new IllegalArgumentException(e);
     }
 
-    initTokenAspect(conf);
+    initTokenAspect();
     if (UserGroupInformation.isSecurityEnabled()) {
       tokenAspect.initDelegationToken(ugi);
     }
@@ -344,14 +343,15 @@ public class HftpFileSystem extends FileSystem
   }
 
   static class RangeHeaderUrlOpener extends ByteRangeInputStream.URLOpener {
-    URLConnectionFactory connectionFactory = URLConnectionFactory.DEFAULT_SYSTEM_CONNECTION_FACTORY;
+    private final URLConnectionFactory connFactory;
 
-    RangeHeaderUrlOpener(final URL url) {
+    RangeHeaderUrlOpener(URLConnectionFactory connFactory, final URL url) {
       super(url);
+      this.connFactory = connFactory;
     }
 
     protected HttpURLConnection openConnection() throws IOException {
-      return (HttpURLConnection)connectionFactory.openConnection(url);
+      return (HttpURLConnection)connFactory.openConnection(url);
     }
 
     /** Use HTTP Range header for specifying offset. */
@@ -381,8 +381,9 @@ public class HftpFileSystem extends FileSystem
       super(o, r);
     }
 
-    RangeHeaderInputStream(final URL url) {
-      this(new RangeHeaderUrlOpener(url), new RangeHeaderUrlOpener(null));
+    RangeHeaderInputStream(URLConnectionFactory connFactory, final URL url) {
+      this(new RangeHeaderUrlOpener(connFactory, url),
+          new RangeHeaderUrlOpener(connFactory, null));
     }
 
     @Override
@@ -397,7 +398,7 @@ public class HftpFileSystem extends FileSystem
     String path = "/data" + ServletUtil.encodePath(f.toUri().getPath());
     String query = addDelegationTokenParam("ugi=" + getEncodedUgiParameter());
     URL u = getNamenodeURL(path, query);
-    return new FSDataInputStream(new RangeHeaderInputStream(u));
+    return new FSDataInputStream(new RangeHeaderInputStream(connectionFactory, u));
   }
 
   @Override
@@ -409,7 +410,7 @@ public class HftpFileSystem extends FileSystem
   /** Class to parse and store a listing reply from the server. */
   class LsParser extends DefaultHandler {
 
-    ArrayList<FileStatus> fslist = new ArrayList<FileStatus>();
+    final ArrayList<FileStatus> fslist = new ArrayList<FileStatus>();
 
     @Override
     public void startElement(String ns, String localname, String qname,
@@ -433,9 +434,9 @@ public class HftpFileSystem extends FileSystem
       } catch (ParseException e) { throw new SAXException(e); }
       FileStatus fs = "file".equals(qname)
         ? new FileStatus(
-              Long.valueOf(attrs.getValue("size")).longValue(), false,
+              Long.parseLong(attrs.getValue("size")), false,
               Short.valueOf(attrs.getValue("replication")).shortValue(),
-              Long.valueOf(attrs.getValue("blocksize")).longValue(),
+              Long.parseLong(attrs.getValue("blocksize")),
               modif, atime, FsPermission.valueOf(attrs.getValue("permission")),
               attrs.getValue("owner"), attrs.getValue("group"),
               HftpFileSystem.this.makeQualified(

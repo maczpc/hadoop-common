@@ -27,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.io.Text;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.security.token.Token;
 import org.apache.hadoop.security.token.delegation.DelegationKey;
@@ -84,7 +85,8 @@ public class TestRMDelegationTokens {
     // the other is created on the first run of
     // tokenRemoverThread.rollMasterKey()
 
-    RMDelegationTokenSecretManager dtSecretManager = rm1.getRMDTSecretManager();
+    RMDelegationTokenSecretManager dtSecretManager =
+        rm1.getRMContext().getRMDelegationTokenSecretManager();
     // assert all master keys are saved
     Assert.assertEquals(dtSecretManager.getAllMasterKeys(), rmDTMasterKeyState);
     Set<DelegationKey> expiringKeys = new HashSet<DelegationKey>();
@@ -102,7 +104,7 @@ public class TestRMDelegationTokens {
     org.apache.hadoop.yarn.api.records.Token delegationToken =
         response.getRMDelegationToken();
     Token<RMDelegationTokenIdentifier> token1 =
-        ConverterUtils.convertFromYarn(delegationToken, null);
+        ConverterUtils.convertFromYarn(delegationToken, (Text) null);
     RMDelegationTokenIdentifier dtId1 = token1.decodeIdentifier();
 
     // wait for the first rollMasterKey
@@ -139,7 +141,8 @@ public class TestRMDelegationTokens {
 
     MockRM rm1 = new MyMockRM(conf, memStore);
     rm1.start();
-    RMDelegationTokenSecretManager dtSecretManager = rm1.getRMDTSecretManager();
+    RMDelegationTokenSecretManager dtSecretManager =
+        rm1.getRMContext().getRMDelegationTokenSecretManager();
 
     // assert all master keys are saved
     Assert.assertEquals(dtSecretManager.getAllMasterKeys(), rmDTMasterKeyState);

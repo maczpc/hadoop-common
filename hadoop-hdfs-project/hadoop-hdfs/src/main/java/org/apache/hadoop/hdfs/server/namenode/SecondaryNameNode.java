@@ -114,7 +114,6 @@ public class SecondaryNameNode implements Runnable {
   private InetSocketAddress nameNodeAddr;
   private volatile boolean shouldRun;
   private HttpServer2 infoServer;
-  private URL imageListenURL;
 
   private Collection<URI> checkpointDirs;
   private List<URI> checkpointEditsDirs;
@@ -267,13 +266,11 @@ public class SecondaryNameNode implements Runnable {
     infoServer.setAttribute("secondary.name.node", this);
     infoServer.setAttribute("name.system.image", checkpointImage);
     infoServer.setAttribute(JspHelper.CURRENT_CONF, conf);
-    infoServer.addInternalServlet("getimage", "/getimage",
-                                  GetImageServlet.class, true);
+    infoServer.addInternalServlet("imagetransfer", ImageServlet.PATH_SPEC,
+        ImageServlet.class, true);
     infoServer.start();
 
     LOG.info("Web server init done");
-    imageListenURL = new URL(DFSUtil.getHttpClientScheme(conf) + "://"
-        + NetUtils.getHostPortString(infoServer.getConnectorAddress(0)));
 
     HttpConfig.Policy policy = DFSUtil.getHttpPolicy(conf);
     int connIdx = 0;
@@ -445,8 +442,9 @@ public class SecondaryNameNode implements Runnable {
             } else {
               LOG.info("Image has changed. Downloading updated image from NN.");
               MD5Hash downloadedHash = TransferFsImage.downloadImageToStorage(
-                  nnHostPort, sig.mostRecentCheckpointTxId, dstImage.getStorage(), true);
-              dstImage.saveDigestAndRenameCheckpointImage(
+                  nnHostPort, sig.mostRecentCheckpointTxId,
+                  dstImage.getStorage(), true);
+              dstImage.saveDigestAndRenameCheckpointImage(NameNodeFile.IMAGE,
                   sig.mostRecentCheckpointTxId, downloadedHash);
             }
         
@@ -486,14 +484,6 @@ public class SecondaryNameNode implements Runnable {
     LOG.debug("Will connect to NameNode at " + address);
     return address.toURL();
   }
-  
-  /**
-   * Return the host:port of where this SecondaryNameNode is listening
-   * for image transfers
-   */
-  private URL getImageListenAddress() {
-    return imageListenURL;
-  }
 
   /**
    * Create a new checkpoint
@@ -511,8 +501,10 @@ public class SecondaryNameNode implements Runnable {
     boolean loadImage = false;
     boolean isFreshCheckpointer = (checkpointImage.getNamespaceID() == 0);
     boolean isSameCluster =
-        (dstStorage.versionSupportsFederation() && sig.isSameCluster(checkpointImage)) ||
-        (!dstStorage.versionSupportsFederation() && sig.namespaceIdMatches(checkpointImage));
+        (dstStorage.versionSupportsFederation(NameNodeLayoutVersion.FEATURES)
+            && sig.isSameCluster(checkpointImage)) ||
+        (!dstStorage.versionSupportsFederation(NameNodeLayoutVersion.FEATURES)
+            && sig.namespaceIdMatches(checkpointImage));
     if (isFreshCheckpointer ||
         (isSameCluster &&
          !sig.storageVersionMatches(checkpointImage.getStorage()))) {
@@ -552,8 +544,8 @@ public class SecondaryNameNode implements Runnable {
     // to make this new uploaded image as the most current image.
     //
     long txid = checkpointImage.getLastAppliedTxId();
-    TransferFsImage.uploadImageFromStorage(fsName, getImageListenAddress(),
-        dstStorage, txid);
+    TransferFsImage.uploadImageFromStorage(fsName, conf, dstStorage,
+        NameNodeFile.IMAGE, txid);
 
     // error simulation code for junit test
     CheckpointFaultInjector.getInstance().afterSecondaryUploadsNewImage();
@@ -802,8 +794,8 @@ public class SecondaryNameNode implements Runnable {
     private int mergeErrorCount;
     private static class CheckpointLogPurger implements LogsPurgeable {
       
-      private NNStorage storage;
-      private StoragePurger purger
+      private final NNStorage storage;
+      private final StoragePurger purger
           = new NNStorageRetentionManager.DeletionStoragePurger();
       
       public CheckpointLogPurger(NNStorage storage) {
@@ -995,7 +987,8 @@ public class SecondaryNameNode implements Runnable {
     
     dstStorage.setStorageInfo(sig);
     if (loadImage) {
-      File file = dstStorage.findImageFile(sig.mostRecentCheckpointTxId);
+      File file = dstStorage.findImageFile(NameNodeFile.IMAGE,
+          sig.mostRecentCheckpointTxId);
       if (file == null) {
         throw new IOException("Couldn't find image file at txid " + 
             sig.mostRecentCheckpointTxId + " even though it should have " +

@@ -179,7 +179,7 @@ http://maven.apache.org/xsd/maven-4.0.0.xsd">
     <dependency>
       <groupId>io.netty</groupId>
       <artifactId>netty</artifactId>
-      <scope>test</scope>
+      <scope>compile</scope>
     </dependency>
   </dependencies>
 
@@ -458,6 +458,7 @@ http://maven.apache.org/xsd/maven-4.0.0.xsd">
                 <includes>
                   <include>ClientDatanodeProtocol.proto</include>
                   <include>DatanodeProtocol.proto</include>
+                  <include>fsimage.proto</include>
                 </includes>
               </source>
               <output>${project.build.directory}/generated-sources/java</output>
@@ -481,6 +482,7 @@ http://maven.apache.org/xsd/maven-4.0.0.xsd">
                 <includes>
                   <include>ClientNamenodeProtocol.proto</include>
                   <include>NamenodeProtocol.proto</include>
+                  <include>acl.proto</include>
                 </includes>
               </source>
               <output>${project.build.directory}/generated-sources/java</output>

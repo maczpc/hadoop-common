@@ -50,7 +50,6 @@ import org.apache.hadoop.yarn.api.records.QueueState;
 import org.apache.hadoop.yarn.api.records.QueueUserACLInfo;
 import org.apache.hadoop.yarn.api.records.Resource;
 import org.apache.hadoop.yarn.api.records.ResourceRequest;
-import org.apache.hadoop.yarn.api.records.Token;
 import org.apache.hadoop.yarn.factories.RecordFactory;
 import org.apache.hadoop.yarn.factory.providers.RecordFactoryProvider;
 import org.apache.hadoop.yarn.server.resourcemanager.rmcontainer.RMContainer;
@@ -837,10 +836,14 @@ public class LeafQueue implements CSQueue {
         
         // Schedule in priority order
         for (Priority priority : application.getPriorities()) {
+          ResourceRequest anyRequest =
+              application.getResourceRequest(priority, ResourceRequest.ANY);
+          if (null == anyRequest) {
+            continue;
+          }
+          
           // Required resource
-          Resource required = 
-              application.getResourceRequest(
-                  priority, ResourceRequest.ANY).getCapability();
+          Resource required = anyRequest.getCapability();
 
           // Do we need containers at this 'priority'?
           if (!needContainers(application, priority, required)) {
@@ -1292,16 +1295,6 @@ public class LeafQueue implements CSQueue {
     return container;
   }
 
-  /**
-   * Create <code>ContainerToken</code>, only in secure-mode
-   */
-  Token createContainerToken(
-      FiCaSchedulerApp application, Container container) {
-    return containerTokenSecretManager.createContainerToken(
-        container.getId(), container.getNodeId(),
-        application.getUser(), container.getResource());
-  }
-
   private Resource assignContainer(Resource clusterResource, FiCaSchedulerNode node, 
       FiCaSchedulerApp application, Priority priority, 
       ResourceRequest request, NodeType type, RMContainer rmContainer) {
@@ -1345,14 +1338,6 @@ public class LeafQueue implements CSQueue {
         unreserve(application, priority, node, rmContainer);
       }
 
-      Token containerToken =
-          createContainerToken(application, container);
-      if (containerToken == null) {
-        // Something went wrong...
-        return Resources.none();
-      }
-      container.setContainerToken(containerToken);
-      
       // Inform the application
       RMContainer allocatedContainer = 
           application.allocate(type, node, priority, request, container);
@@ -1428,12 +1413,14 @@ public class LeafQueue implements CSQueue {
       FiCaSchedulerApp application, FiCaSchedulerNode node, RMContainer rmContainer, 
       ContainerStatus containerStatus, RMContainerEventType event, CSQueue childQueue) {
     if (application != null) {
+
+      boolean removed = false;
+
       // Careful! Locking order is important!
       synchronized (this) {
 
         Container container = rmContainer.getContainer();
 
-        boolean removed = false;
         // Inform the application & the node
         // Note: It's safe to assume that all state changes to RMContainer
         // happen under scheduler's lock... 
@@ -1459,13 +1446,14 @@ public class LeafQueue implements CSQueue {
               " absoluteUsedCapacity=" + getAbsoluteUsedCapacity() +
               " used=" + usedResources +
               " cluster=" + clusterResource);
-          // Inform the parent queue
-          getParent().completedContainer(clusterResource, application,
-              node, rmContainer, null, event, this);
         }
       }
 
-
+      if (removed) {
+        // Inform the parent queue _outside_ of the leaf-queue lock
+        getParent().completedContainer(clusterResource, application, node,
+          rmContainer, null, event, this);
+      }
     }
   }
 
